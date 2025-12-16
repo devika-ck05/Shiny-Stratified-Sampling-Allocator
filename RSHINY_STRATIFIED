@@ -1,0 +1,251 @@
+# 1. Setup and Libraries 
+library(shiny)
+library(rhandsontable)
+library(dplyr)
+library(ggplot2)
+
+# 2. UI Layout 
+ui <- fluidPage(
+  titlePanel("Stratified Sampling: Sample Size Determination"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      h4("Global Parameters"),
+      
+      # Margin of Error (Precision)
+      numericInput("margin_error", 
+                   "Margin of Error (E) / Sampling Bias:", 
+                   value = 2.0, step = 0.1),
+      
+      # Confidence Level
+      selectInput("conf_level", "Confidence Level:",
+                  choices = c("90%" = 1.645, "95%" = 1.96, "99%" = 2.576),
+                  selected = 1.96),
+      
+      hr(),
+      
+      h4("Strata Configuration"),
+      numericInput("num_strata", "Number of Strata:", value = 3, min = 2, max = 10),
+      
+      helpText("Edit the table on the right to input strata details."),
+      hr(),
+      
+      h4("Optimization Constraint"),
+      radioButtons("opt_variable", "Optimize Allocation Based On:",
+                   choices = c("Cost (Money)" = "cost", "Time (Hours)" = "time"),
+                   selected = "cost"),
+      
+      actionButton("calc_btn", "Calculate Sample Sizes", class = "btn-primary")
+    ),
+    
+    mainPanel(
+      tabsetPanel(
+        # Tab 1: Data Input
+        tabPanel("1. Strata Data Input",
+                 h4("Enter Strata Parameters"),
+                 p("Double-click cells to edit. N_h = Size, S_h = Std Dev, Cost = Cost per unit, Time = Time per unit."),
+                 rHandsontableOutput("hot_strata"),
+                 verbatimTextOutput("validation_msg")
+        ),
+        
+        # Tab 2: Allocation Results
+        tabPanel("2. Allocation Results",
+                 h4("Sample Size & Allocation Summary"),
+                 tableOutput("summary_table"),
+                 h5("Detailed Allocation by Stratum"),
+                 tableOutput("allocation_detail_table")
+        ),
+        
+        # Tab 3: Visual Comparison
+        tabPanel("3. Visual Analysis",
+                 plotOutput("allocation_plot"),
+                 plotOutput("cost_time_plot")
+        )
+      )
+    )
+  )
+)
+
+# 3. Server Logic 
+server <- function(input, output, session) {
+  
+  # Initialize Reactive Values
+  values <- reactiveValues()
+  
+  # Default Data Generation
+  observe({
+    n_strata <- input$num_strata
+    
+    # Check if data already exists and matches row count, otherwise reset
+    if (is.null(values$data) || nrow(values$data) != n_strata) {
+      values$data <- data.frame(
+        Stratum = paste("Stratum", 1:n_strata),
+        N_h = rep(1000, n_strata),        # Population Size
+        S_h = runif(n_strata, 10, 50),    # Standard Deviation
+        Cost = runif(n_strata, 5, 20),    # Cost per unit
+        Time = runif(n_strata, 0.5, 4),   # Time per unit
+        stringsAsFactors = FALSE
+      )
+    }
+  })
+  
+  # Render Handsontable for Data Input
+  output$hot_strata <- renderRHandsontable({
+    req(values$data)
+    rhandsontable(values$data, rowHeaders = NULL) %>%
+      hot_col("N_h", format = "0") %>%
+      hot_col("S_h", format = "0.00") %>%
+      hot_col("Cost", format = "0.00") %>%
+      hot_col("Time", format = "0.00") %>%
+      hot_table(highlightCol = TRUE, highlightRow = TRUE)
+  })
+  
+  # Update reactive data when table is edited
+  observeEvent(input$hot_strata, {
+    values$data <- hot_to_r(input$hot_strata)
+  })
+  
+  # Calculation Logic
+  results <- eventReactive(input$calc_btn, {
+    req(values$data)
+    df <- values$data
+    
+    # Parameters
+    E <- input$margin_error
+    Z <- as.numeric(input$conf_level)
+    Target_V <- (E / Z)^2  # Target Variance V = (E/Z)^2
+    
+    N_total <- sum(df$N_h)
+    df$W_h <- df$N_h / N_total
+    
+    # Pre-calculations
+    WS2_sum <- sum(df$W_h * df$S_h^2) # Sum(Wh * Sh^2)
+    
+    # --- 1. Proportional Allocation ---
+    # Formula: n = Sum(Wh * Sh^2) / (V + (1/N)*Sum(Wh * Sh^2))
+    # Note: Simplified approx is often used, but exact for fixed V is:
+    # n = (N * Sum(Nh * Sh^2)) / (N^2 * V + Sum(Nh * Sh^2))
+    term_prop_top <- N_total * sum(df$N_h * df$S_h^2)
+    term_prop_bot <- (N_total^2 * Target_V) + sum(df$N_h * df$S_h^2)
+    n_prop <- term_prop_top / term_prop_bot
+    
+    df$n_prop <- round(n_prop * df$W_h)
+    
+    # --- 2. Neyman Allocation ---
+    # Formula: n = (Sum(Wh * Sh))^2 / (V + (1/N)*Sum(Wh * Sh^2))
+    term_neyman_top <- (sum(df$W_h * df$S_h))^2
+    term_neyman_bot <- Target_V + (1/N_total) * WS2_sum
+    n_neyman <- term_neyman_top / term_neyman_bot
+    
+    # Allocation weights: (Nh * Sh) / Sum(Nh * Sh)
+    neyman_weights <- (df$N_h * df$S_h) / sum(df$N_h * df$S_h)
+    df$n_neyman <- round(n_neyman * neyman_weights)
+    
+    # --- 3. Optimized Allocation (Cost or Time) ---
+    # Variable to optimize (C_h)
+    if(input$opt_variable == "cost") {
+      C_h <- df$Cost
+    } else {
+      C_h <- df$Time
+    }
+    
+    # Formula: n = [Sum(Wh*Sh*sqrt(Ch)) * Sum(Wh*Sh/sqrt(Ch))] / [V + (1/N)*Sum(Wh*Sh^2)]
+    term1 <- sum(df$W_h * df$S_h * sqrt(C_h))
+    term2 <- sum(df$W_h * df$S_h / sqrt(C_h))
+    term_opt_bot <- Target_V + (1/N_total) * WS2_sum
+    n_opt <- (term1 * term2) / term_opt_bot
+    
+    # Allocation weights: (Nh * Sh / sqrt(Ch)) / Sum(...)
+    opt_weights <- (df$N_h * df$S_h / sqrt(C_h)) / sum(df$N_h * df$S_h / sqrt(C_h))
+    df$n_opt <- round(n_opt * opt_weights)
+    
+    # --- Calculate Totals ---
+    # Ensure min sample size of 2 per stratum to calculate variance later
+    df$n_prop <- pmax(2, df$n_prop)
+    df$n_neyman <- pmax(2, df$n_neyman)
+    df$n_opt <- pmax(2, df$n_opt)
+    
+    # Calculate Total Costs and Time for the resulting allocations
+    res_list <- list(
+      detail = df,
+      n_total_prop = sum(df$n_prop),
+      n_total_neyman = sum(df$n_neyman),
+      n_total_opt = sum(df$n_opt),
+      
+      cost_prop = sum(df$n_prop * df$Cost),
+      cost_neyman = sum(df$n_neyman * df$Cost),
+      cost_opt = sum(df$n_opt * df$Cost),
+      
+      time_prop = sum(df$n_prop * df$Time),
+      time_neyman = sum(df$n_neyman * df$Time),
+      time_opt = sum(df$n_opt * df$Time)
+    )
+    return(res_list)
+  })
+  
+  # Outputs 
+  
+  output$summary_table <- renderTable({
+    res <- results()
+    
+    summary_df <- data.frame(
+      Method = c("Proportional", "Neyman", paste("Optimized (", input$opt_variable, ")", sep="")),
+      `Total Sample Size (n)` = c(res$n_total_prop, res$n_total_neyman, res$n_total_opt),
+      `Total Cost` = c(res$cost_prop, res$cost_neyman, res$cost_opt),
+      `Total Time` = c(res$time_prop, res$time_neyman, res$time_opt)
+    )
+    summary_df
+  }, digits = 0)
+  
+  output$allocation_detail_table <- renderTable({
+    res <- results()
+    df <- res$detail
+    
+    # Select relevant columns for display
+    display_df <- df[, c("Stratum", "N_h", "S_h", "Cost", "Time", "n_prop", "n_neyman", "n_opt")]
+    colnames(display_df) <- c("Stratum", "Pop Size (Nh)", "Std Dev (Sh)", "Cost/Unit", "Time/Unit", 
+                              "n (Prop)", "n (Neyman)", "n (Optimized)")
+    display_df
+  }, digits = 0)
+  
+  output$allocation_plot <- renderPlot({
+    res <- results()
+    df <- res$detail
+    
+    # Reshape for ggplot
+    plot_data <- data.frame(
+      Stratum = rep(df$Stratum, 3),
+      Allocation = c(df$n_prop, df$n_neyman, df$n_opt),
+      Method = rep(c("Proportional", "Neyman", "Optimized"), each = nrow(df))
+    )
+    
+    ggplot(plot_data, aes(x = Stratum, y = Allocation, fill = Method)) +
+      geom_bar(stat = "identity", position = "dodge") +
+      theme_minimal() +
+      labs(title = "Sample Allocation per Stratum by Method",
+           y = "Sample Size (nh)") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  })
+  
+  output$cost_time_plot <- renderPlot({
+    res <- results()
+    
+    # Data for efficiency comparison
+    comp_data <- data.frame(
+      Method = c("Proportional", "Neyman", "Optimized"),
+      Cost = c(res$cost_prop, res$cost_neyman, res$cost_opt),
+      Time = c(res$time_prop, res$time_neyman, res$time_opt)
+    )
+    
+    # Normalize for visualization if scales differ wildly
+    # Plotting actual values
+    par(mfrow=c(1,2))
+    barplot(comp_data$Cost, names.arg = comp_data$Method, col = "lightblue", 
+            main = "Total Cost Comparison", ylab = "Currency")
+    barplot(comp_data$Time, names.arg = comp_data$Method, col = "lightgreen", 
+            main = "Total Time Comparison", ylab = "Time Units")
+  })
+}
+
+# 4. Run App 
+shinyApp(ui = ui, server = server)
